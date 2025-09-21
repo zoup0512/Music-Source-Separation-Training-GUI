@@ -1,72 +1,54 @@
 # coding: utf-8
-__author__ = 'Roman Solovyev (ZFTurbo): https://github.com/ZFTurbo/'
-__version__ = '1.0.5'
+__author__ = 'Ilya Kiselev (kiselecheck): https://github.com/kiselecheck'
+__version__ = '1.0.1'
 
+import sys
 import argparse
-
-import numpy as np
 from tqdm.auto import tqdm
-import torch
 import wandb
+import numpy as np
+import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
 from torch.cuda.amp.grad_scaler import GradScaler
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from ml_collections import ConfigDict
-from typing import List, Callable
+import torch.distributed as dist
+import torch.multiprocessing as mp
 import loralib as lora
 
-from utils.dataset import prepare_data
-from utils.settings import parse_args_train, initialize_environment, wandb_init, get_model_from_config
-from utils.model_utils import bind_lora_to_model, load_start_checkpoint, save_weights, normalize_batch, \
-    initialize_model_and_device, get_optimizer, save_last_weights, log_model_info
+from ml_collections import ConfigDict
+from typing import List, Callable
 
 from utils.losses import choice_loss
-from valid import valid_multi_gpu, valid
-
-
+from utils.model_utils import bind_lora_to_model, load_start_checkpoint, normalize_batch, get_optimizer, save_weights, \
+    save_last_weights, log_model_info
+from utils.settings import get_model_from_config, parse_args_train, initialize_environment_ddp, cleanup_ddp, wandb_init
+from valid_ddp import valid_multi_gpu
+from utils.dataset import prepare_data
 import warnings
+
 warnings.filterwarnings("ignore")
 
 
-def train_one_epoch(model: torch.nn.Module, config: ConfigDict, args: argparse.Namespace, optimizer: torch.optim.Optimizer,
-                    device: torch.device, device_ids: List[int], epoch: int, use_amp: bool, scaler: torch.cuda.amp.GradScaler,
+def train_one_epoch(model: torch.nn.Module, config: ConfigDict, args: argparse.Namespace,
+                    optimizer: torch.optim.Optimizer,
+                    device: torch.device, device_ids: List[int], epoch: int, use_amp: bool,
+                    scaler: torch.cuda.amp.GradScaler,
                     gradient_accumulation_steps: int, train_loader: torch.utils.data.DataLoader,
                     multi_loss: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]) -> None:
-    """
-    Train the model for one epoch.
-
-    Args:
-        model: The model to train.
-        config: Configuration object containing training parameters.
-        args: Command-line arguments with specific settings (e.g., model type).
-        optimizer: Optimizer used for training.
-        device: Device to run the model on (CPU or GPU).
-        device_ids: List of GPU device IDs if using multiple GPUs.
-        epoch: The current epoch number.
-        use_amp: Whether to use automatic mixed precision (AMP) for training.
-        scaler: Scaler for AMP to manage gradient scaling.
-        gradient_accumulation_steps: Number of gradient accumulation steps before updating the optimizer.
-        train_loader: DataLoader for the training dataset.
-        multi_loss: The loss function to use during training.
-
-    Returns:
-        None
-    """
-
-    model.train().to(device)
-    print(f'Train epoch: {epoch} Learning rate: {optimizer.param_groups[0]["lr"]}')
+    model.train()
+    if dist.get_rank() == 0:
+        print(f'Train epoch: {epoch} Learning rate: {optimizer.param_groups[0]["lr"]}')
     loss_val = 0.
     total = 0
 
     normalize = getattr(config.training, 'normalize', False)
+    get_internal_loss = (args.model_type in ('mel_band_conformer',) or 'roformer' in args.model_type
+                         ) and not args.use_standard_loss
+    pbar = tqdm(train_loader,
+                dynamic_ncols=True) if dist.get_rank() == 0 else train_loader  # Only main process print progress bar
 
-    get_internal_loss = ( args.model_type in ('mel_band_conformer',) or 'roformer' in args.model_type
-                    ) and not args.use_standard_loss
-
-    pbar = tqdm(train_loader)
     for i, (batch, mixes) in enumerate(pbar):
-        x = mixes.to(device)  # mixture
+        x = mixes.to(device)
         y = batch.to(device)
 
         if normalize:
@@ -76,7 +58,6 @@ def train_one_epoch(model: torch.nn.Module, config: ConfigDict, args: argparse.N
             if get_internal_loss:
                 loss = model(x, y)
                 if isinstance(device_ids, (list, tuple)):
-                    # If it's multiple GPUs sum partial loss
                     loss = loss.mean()
             else:
                 y_ = model(x)
@@ -84,28 +65,36 @@ def train_one_epoch(model: torch.nn.Module, config: ConfigDict, args: argparse.N
 
         loss /= gradient_accumulation_steps
         scaler.scale(loss).backward()
+
         if config.training.grad_clip:
             nn.utils.clip_grad_norm_(model.parameters(), config.training.grad_clip)
 
-        if ((i + 1) % gradient_accumulation_steps == 0) or (i == len(train_loader) - 1):
+        if (i + 1) % gradient_accumulation_steps == 0 or (i == len(train_loader) - 1):
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
-        li = loss.item() * gradient_accumulation_steps
-        loss_val += li
-        total += 1
-        pbar.set_postfix({'loss': 100 * li, 'avg_loss': 100 * loss_val / (i + 1)})
-        wandb.log({'loss': 100 * li, 'avg_loss': 100 * loss_val / (i + 1), 'i': i})
-        loss.detach()
+        with torch.no_grad():
+            loss_copy = loss.detach().clone()
+            dist.all_reduce(loss_copy, op=dist.ReduceOp.SUM)
+            loss_copy /= dist.get_world_size()
 
-    print(f'Training loss: {loss_val / total}')
-    wandb.log({'train_loss': loss_val / total, 'epoch': epoch, 'learning_rate': optimizer.param_groups[0]['lr']})
+        if dist.get_rank() == 0:
+            li = loss_copy.item() * gradient_accumulation_steps
+            loss_val += li
+            total += 1
+            pbar.set_postfix({'loss': 100 * li, 'avg_loss': 100 * loss_val / (i + 1)})
+            sys.stdout.flush()
+            wandb.log({'loss': 100 * li, 'avg_loss': 100 * loss_val / (i + 1), 'i': i})
+
+    if dist.get_rank() == 0:
+        print(f'Training loss: {loss_val / total}')
+        wandb.log({'train_loss': loss_val / total, 'epoch': epoch, 'learning_rate': optimizer.param_groups[0]['lr']})
 
 
 def compute_epoch_metrics(model: torch.nn.Module, args: argparse.Namespace, config: ConfigDict,
-                          device: torch.device, device_ids: List[int], best_metric: float,
-                          epoch: int, scheduler: torch.optim.lr_scheduler.ReduceLROnPlateau, optimizer, all_time_all_metrics) -> float:
+                          best_metric: float,
+                          epoch: int, all_time_all_metrics, scheduler: torch.optim.lr_scheduler._LRScheduler, optimizer, metrics_avg, all_metrics) -> float:
     """
     Compute and log the metrics for the current epoch, and save model weights if the metric improves.
 
@@ -113,23 +102,18 @@ def compute_epoch_metrics(model: torch.nn.Module, args: argparse.Namespace, conf
         model: The model to evaluate.
         args: Command-line arguments containing configuration paths and other settings.
         config: Configuration dictionary containing training settings.
-        device: The device (CPU or GPU) used for evaluation.
-        device_ids: List of GPU device IDs when using multiple GPUs.
         best_metric: The best metric value seen so far.
         epoch: The current epoch number.
         scheduler: The learning rate scheduler to adjust the learning rate.
-        optimizer:
-        all_time_all_metrics:
+        rank: The rank of the current process in DDP.
+        world_size: The total number of processes in DDP.
+
     Returns:
         The updated best_metric.
     """
 
-    if torch.cuda.is_available() and len(device_ids) > 1:
-        metrics_avg, all_metrics = valid_multi_gpu(model, args, config, args.device_ids, verbose=False)
-    else:
-        metrics_avg, all_metrics = valid(model, args, config, device, verbose=False)
-    all_time_all_metrics[f"epoch_{epoch}"] = all_metrics
     metric_avg = metrics_avg[args.metric_for_scheduler]
+
     if metric_avg > best_metric:
 
         if args.each_metrics_in_name:
@@ -149,9 +133,9 @@ def compute_epoch_metrics(model: torch.nn.Module, args: argparse.Namespace, conf
             store_path = (
                 f"{args.results_path}/model_{args.model_type}_ep_{epoch}_{args.metric_for_scheduler}_{metric_avg:.4f}.ckpt"
             )
-        print(f'Store weights: {store_path}')
-        train_lora = args.train_lora
-        save_weights(store_path, model, device_ids, optimizer, epoch, all_time_all_metrics, metric_avg, scheduler, train_lora)
+        if dist.get_rank() == 0:
+            print(f'Store weights: {store_path}')
+            save_weights(store_path, model, args.device_ids, optimizer, epoch, all_time_all_metrics, metric_avg, scheduler, args.train_lora)
         best_metric = metric_avg
 
     if args.save_weights_every_epoch:
@@ -159,7 +143,7 @@ def compute_epoch_metrics(model: torch.nn.Module, args: argparse.Namespace, conf
         for m in metrics_avg:
             metric_string += '_{}_{:.4f}'.format(m, metrics_avg[m])
         store_path = f'{args.results_path}/model_{args.model_type}_ep_{epoch}{metric_string}.ckpt'
-        save_weights(store_path, model, device_ids, optimizer, epoch, all_time_all_metrics, best_metric, scheduler, train_lora)
+        save_weights(store_path, model, args.device_ids, optimizer, epoch, all_time_all_metrics, best_metric, scheduler, args.train_lora)
 
     scheduler.step(metric_avg)
     wandb.log({'metric_main': metric_avg, 'best_metric': best_metric})
@@ -169,7 +153,7 @@ def compute_epoch_metrics(model: torch.nn.Module, args: argparse.Namespace, conf
     return best_metric
 
 
-def train_model(args: argparse.Namespace) -> None:
+def train_model_single(rank: int, world_size: int, args=None):
     """
     Trains the model based on the provided arguments, including data preparation, optimizer setup,
     and loss calculation. The model is trained for multiple epochs with logging via wandb.
@@ -183,11 +167,10 @@ def train_model(args: argparse.Namespace) -> None:
 
     args = parse_args_train(args)
 
-    initialize_environment(args.seed, args.results_path)
+    initialize_environment_ddp(rank, world_size, args.seed, args.results_path)
     model, config = get_model_from_config(args.model_type, args.config_path)
     use_amp = getattr(config.training, 'use_amp', True)
-    device_ids = args.device_ids
-    batch_size = config.training.batch_size * len(device_ids)
+    batch_size = config.training.batch_size
 
     wandb_init(args, config, batch_size)
 
@@ -201,13 +184,12 @@ def train_model(args: argparse.Namespace) -> None:
         model = bind_lora_to_model(config, model)
         lora.mark_only_lora_as_trainable(model)
 
-    device, model = initialize_model_and_device(model, args.device_ids)
+    device = torch.device(f'cuda:{rank}')
+    model.to(device)
+    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[rank])
 
     if args.pre_valid:
-        if torch.cuda.is_available() and len(device_ids) > 1:
-            valid_multi_gpu(model, args, config, args.device_ids, verbose=True)
-        else:
-            valid(model, args, config, device, verbose=True)
+        valid_multi_gpu(model, args, config, args.device_ids, verbose=False)
 
     gradient_accumulation_steps = int(getattr(config.training, 'gradient_accumulation_steps', 1))
 
@@ -245,28 +227,45 @@ def train_model(args: argparse.Namespace) -> None:
         torch.cuda.set_per_process_memory_fraction(1.0)
     torch.cuda.empty_cache()
 
-    print(
-        f"Instruments: {config.training.instruments}\n"
-        f"Losses for training: {args.loss}\n"
-        f"Metrics for training: {args.metrics}. Metric for scheduler: {args.metric_for_scheduler}\n"
-        f"Patience: {config.training.patience} "
-        f"Reduce factor: {config.training.reduce_factor}\n"
-        f"Batch size: {batch_size} "
-        f"Grad accum steps: {gradient_accumulation_steps} "
-        f"Effective batch size: {batch_size * gradient_accumulation_steps}\n"
-        f"Dataset type: {args.dataset_type}\n"
-        f"Optimizer: {config.training.optimizer}"
-    )
+    if rank == 0:
+        print(
+            f"Instruments: {config.training.instruments}\n"
+            f"Metrics for training: {args.metrics}. Metric for scheduler: {args.metric_for_scheduler}\n"
+            f"Patience: {config.training.patience} "
+            f"Reduce factor: {config.training.reduce_factor}\n"
+            f"Batch size: {batch_size} "
+            f"Grad accum steps: {gradient_accumulation_steps} "
+            f"Num gpus: {world_size} "
+            f"Effective batch size: {batch_size * gradient_accumulation_steps * world_size}\n"
+            f"Dataset type: {args.dataset_type}\n"
+            f"Optimizer: {config.training.optimizer}"
+        )
 
-    print(f'Train for: {config.training.num_epochs} epochs')
-    log_model_info(model, args.results_path)
+        print(f'Train for: {config.training.num_epochs} epochs')
+        log_model_info(model, args.results_path)
     for epoch in range(start_epoch, config.training.num_epochs):
+        train_loader.sampler.set_epoch(epoch)
 
-        train_one_epoch(model, config, args, optimizer, device, device_ids, epoch,
-                        use_amp, scaler, gradient_accumulation_steps, train_loader, multi_loss)
-        save_last_weights(args, model, device_ids, optimizer, epoch, all_time_all_metrics, best_metric, scheduler)
-        best_metric = compute_epoch_metrics(model, args, config, device, device_ids, best_metric, epoch, scheduler, optimizer, all_time_all_metrics)
+        train_one_epoch(model, config, args, optimizer, device, args.device_ids, epoch,
+                           use_amp, scaler, gradient_accumulation_steps, train_loader, multi_loss)
 
+        if rank == 0:
+            save_last_weights(args, model, args.device_ids, optimizer, epoch, all_time_all_metrics, best_metric, scheduler)
+        metrics_avg, all_metrics = valid_multi_gpu(model, args, config, args.device_ids, verbose=False)
+        if rank == 0:
+            all_time_all_metrics[f"epoch_{epoch}"] = all_metrics
+            best_metric = compute_epoch_metrics(model, args, config, best_metric, epoch, all_time_all_metrics, scheduler, optimizer, metrics_avg, all_metrics)
+
+    cleanup_ddp()  # Close DDP
+
+
+def train_model(args=None):
+    world_size = torch.cuda.device_count()
+    try:
+        mp.spawn(train_model_single, args=(world_size, args), nprocs=world_size, join=True)
+    except Exception as e:
+        cleanup_ddp()
+        raise e
 
 if __name__ == "__main__":
-    train_model(None)
+    train_model()

@@ -1,46 +1,98 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from functools import partial
 from utils.model_utils import prefer_target_instrument
 
-class STFT:
-    def __init__(self, config):
-        self.n_fft = config.n_fft
-        self.hop_length = config.hop_length
-        self.window = torch.hann_window(window_length=self.n_fft, periodic=True)
-        self.dim_f = config.dim_f
 
-    def __call__(self, x):
-        window = self.window.to(x.device)
-        batch_dims = x.shape[:-2]
-        c, t = x.shape[-2:]
-        x = x.reshape([-1, t])
-        x = torch.stft(
-            x,
-            n_fft=self.n_fft,
-            hop_length=self.hop_length,
-            window=window,
-            center=True,
-            return_complex=True
-        )
-        x = torch.view_as_real(x)
-        x = x.permute([0, 3, 1, 2])
-        x = x.reshape([*batch_dims, c, 2, -1, x.shape[-1]]).reshape([*batch_dims, c * 2, -1, x.shape[-1]])
-        return x[..., :self.dim_f, :]
+class ShortTimeHartleyTransform:
+    def __init__(self, *, n_fft: int, hop_length: int, center: bool = True,
+                 pad_mode: str = "reflect") -> None:
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.center = center
+        self.pad_mode = pad_mode
+        self.window = torch.hamming_window(self.n_fft)
 
-    def inverse(self, x):
-        window = self.window.to(x.device)
-        batch_dims = x.shape[:-3]
-        c, f, t = x.shape[-3:]
-        n = self.n_fft // 2 + 1
-        f_pad = torch.zeros([*batch_dims, c, n - f, t]).to(x.device)
-        x = torch.cat([x, f_pad], -2)
-        x = x.reshape([*batch_dims, c // 2, 2, n, t]).reshape([-1, 2, n, t])
-        x = x.permute([0, 2, 3, 1])
-        x = x[..., 0] + x[..., 1] * 1.j
-        x = torch.istft(x, n_fft=self.n_fft, hop_length=self.hop_length, window=window, center=True)
-        x = x.reshape([*batch_dims, 2, -1])
-        return x
+    @staticmethod
+    def _hartley_transform(x: torch.Tensor) -> torch.Tensor:
+        fft = torch.fft.fft(x)
+        return fft.real - fft.imag
+
+    @staticmethod
+    def _inverse_hartley_transform(X: torch.Tensor) -> torch.Tensor:
+        N = X.size(-1)
+        return ShortTimeHartleyTransform._hartley_transform(X) / N
+
+    def transform(self, *, signal: torch.Tensor) -> torch.Tensor:
+        assert signal.dim() == 3, "Signal must be a 3D tensor (batch_size, channel, samples)"
+        self.window = self.window.to(signal.device)
+        batch_size, channels, samples = signal.shape
+
+        # Apply padding if center=True
+        if self.center:
+            pad_length = self.n_fft // 2
+            signal = F.pad(signal, (pad_length, pad_length), mode=self.pad_mode)
+        else:
+            pad_length = 0
+
+        # print(
+        # f"samples={samples}\n"
+        # f"self.hop_length={self.hop_length}\n"
+        # f"pad_length={pad_length}\n"
+        # f"signal_padded={signal.size(2)}"
+        # )
+
+        # Compute number of frames
+        num_frames = (signal.size(2) - self.n_fft) // self.hop_length + 1
+
+        # Apply window and compute Hartley transform
+        window = self.window.to(signal.device, signal.dtype).unsqueeze(0).unsqueeze(0)
+        stht_coeffs = []
+
+        for i in range(num_frames):
+            start = i * self.hop_length
+            end = start + self.n_fft
+            frame = signal[:, :, start:end] * window
+            stht_coeffs.append(self._hartley_transform(frame))
+
+        return torch.stack(stht_coeffs, dim=-1)
+
+    def inverse_transform(self, *, stht_coeffs: torch.Tensor, length: int) -> torch.Tensor:
+        self.window = self.window.to(stht_coeffs.device)
+        # print(stht_coeffs.shape)
+        batch_size, channels, n_fft, num_frames = stht_coeffs.shape
+        signal_length = length
+
+        # Initialize reconstruction
+        reconstructed_signal = torch.zeros((batch_size, channels, signal_length + (self.n_fft if self.center else 0)),
+                                           device=stht_coeffs.device, dtype=stht_coeffs.dtype)
+        normalization = torch.zeros(signal_length + (self.n_fft if self.center else 0),
+                                    device=stht_coeffs.device, dtype=stht_coeffs.dtype)
+
+        window = self.window.to(stht_coeffs.device, stht_coeffs.dtype).unsqueeze(0).unsqueeze(0)
+
+        for i in range(num_frames):
+            start = i * self.hop_length
+            end = start + self.n_fft
+
+            # Reconstruct frame and add to signal
+            frame = self._inverse_hartley_transform(stht_coeffs[:, :, :, i]) * window
+            reconstructed_signal[:, :, start:end] += frame
+            normalization[start:end] += (window ** 2).squeeze()
+
+        # Normalize the overlapping regions
+        eps = torch.finfo(normalization.dtype).eps
+        normalization = torch.clamp(normalization, min=eps)
+        reconstructed_signal /= normalization.unsqueeze(0).unsqueeze(0)
+
+        # Remove padding if center=True
+        if self.center:
+            pad_length = self.n_fft // 2
+            reconstructed_signal = reconstructed_signal[:, :, pad_length:-pad_length]
+
+        # Trim to the specified length
+        return reconstructed_signal[:, :, :signal_length]
 
 
 def get_norm(norm_type):
@@ -148,14 +200,15 @@ class TFC_TDF_net(nn.Module):
         self.num_target_instruments = len(prefer_target_instrument(config))
         self.num_subbands = config.model.num_subbands
 
-        dim_c = self.num_subbands * config.audio.num_channels * 2
+        # dim_c = self.num_subbands * config.audio.num_channels * 2
+        dim_c = self.num_subbands * config.audio.num_channels
         n = config.model.num_scales
         scale = config.model.scale
         l = config.model.num_blocks_per_scale
         c = config.model.num_channels
         g = config.model.growth
         bn = config.model.bottleneck_factor
-        f = config.audio.dim_f // self.num_subbands
+        f = config.audio.dim_f // (self.num_subbands // 2)
 
         self.first_conv = nn.Conv2d(dim_c, c, 1, 1, 0, bias=False)
 
@@ -185,7 +238,7 @@ class TFC_TDF_net(nn.Module):
             nn.Conv2d(c, self.num_target_instruments * dim_c, 1, 1, 0, bias=False)
         )
 
-        self.stft = STFT(config.audio)
+        self.stft = ShortTimeHartleyTransform(n_fft=config.audio.n_fft, hop_length=config.audio.hop_length)
 
     def cac2cws(self, x):
         k = self.num_subbands
@@ -202,31 +255,50 @@ class TFC_TDF_net(nn.Module):
         return x
 
     def forward(self, x):
-
-        x = self.stft(x)
+        length = x.shape[-1]
+        # print(x.shape)
+        x = self.stft.transform(signal=x)
+        # print(x.shape)
 
         mix = x = self.cac2cws(x)
 
+        # print(x.shape)
+
         first_conv_out = x = self.first_conv(x)
 
+        # print(x.shape)
+
         x = x.transpose(-1, -2)
+
+        # print(x.shape)
 
         encoder_outputs = []
         for block in self.encoder_blocks:
+            # print(x.shape)
             x = block.tfc_tdf(x)
+            # print(x.shape)
             encoder_outputs.append(x)
             x = block.downscale(x)
+            # print(x.shape)
 
         x = self.bottleneck_block(x)
+        # print(x.shape)
 
         for block in self.decoder_blocks:
+            # print(x.shape)
             x = block.upscale(x)
+            # print(x.shape)
             x = torch.cat([x, encoder_outputs.pop()], 1)
+            # print(x.shape)
             x = block.tfc_tdf(x)
+            # print(x.shape)
 
         x = x.transpose(-1, -2)
+        # print(x.shape)
 
         x = x * first_conv_out  # reduce artifacts
+
+        # print(x.shape)
 
         x = self.final_conv(torch.cat([mix, x], 1))
 
@@ -234,8 +306,10 @@ class TFC_TDF_net(nn.Module):
 
         if self.num_target_instruments > 1:
             b, c, f, t = x.shape
-            x = x.reshape(b, self.num_target_instruments, -1, f, t)
-
-        x = self.stft.inverse(x)
-
+            x = x.reshape(b * self.num_target_instruments, -1, f, t)
+            x = self.stft.inverse_transform(stht_coeffs=x, length=length)
+            x = x.reshape(b, self.num_target_instruments, x.shape[-2], x.shape[-1])
+        else:
+            x = self.stft.inverse_transform(stht_coeffs=x, length=length)
+        # print("!!!", x.shape)
         return x
