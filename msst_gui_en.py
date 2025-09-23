@@ -10,12 +10,13 @@ import shutil
 import pynvml
 import platform
 import copy
+import re
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QPushButton, QLabel, QComboBox, QCheckBox,
                              QFileDialog, QTextEdit, QMessageBox, QInputDialog,
                              QHBoxLayout, QGroupBox, QFormLayout, QLineEdit,
                              QDialog, QTableWidget, QTableWidgetItem, QHeaderView,
-                             QTabWidget, QScrollArea, QToolButton, QSizePolicy)
+                             QTabWidget, QScrollArea, QToolButton, QSizePolicy, QDialogButtonBox)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer, QMutex, QWaitCondition, pyqtSlot, QMetaObject, Q_ARG, QUrl
 from PyQt5.QtGui import QFont, QIcon, QColor, QTextCharFormat, QTextCursor, QPainter, QPixmap, QDesktopServices, QFontInfo
 import resources_rc
@@ -28,7 +29,7 @@ logging.basicConfig(filename='msst_gui.log', level=logging.DEBUG,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-CONFIG_FILE = 'model_config.json'
+CONFIG_FILE = 'model_config_en.json'
 
 
 def remove_screen_splash():
@@ -59,33 +60,49 @@ def load_or_create_config():
     if not os.path.exists(CONFIG_FILE):
         initial_config = {
             "vocal_models": {
-                "None": "Do not use vocal separation",
-                "MelBandRoformer_kim.ckpt": "\u3010Recommended\u3011 Slightly better SDR than the other two and halves the time",
-                "model_bs_roformer_ep_317_sdr_12.9755.ckpt": "Note: 1297 has slightly higher SDR, but may introduce noise at very high frequencies",
-                "model_bs_roformer_ep_368_sdr_12.9628.ckpt": "1296 version, without the potential high-frequency noise issue"
+                "None": "Disable vocal separation",
+                "MelBandRoformer_kim.ckpt": "[Rec] SDR≈1297&1296 but 2x faster, good for vocals & instrumental",
+                "BS-Roformer-Resurrection.ckpt": "[Rec] Vocal specialist, preserves details/harmonies, high SDR(11.34)",
+                "logic_roformer.pt": "[Rec] Multi-track separation (bass, drums, piano, guitar, vocals, others), best SDR for instruments",
+                "mel_band_roformer_vocals_becruily.ckpt": "Vocal specialist using fullness metric (more detail but more noise)",
+                "BS_ResurrectioN.ckpt": "Instrumental specialist, higher fullness but may leak pads to vocals",
+                "inst_v1e.ckpt": "Instrumental specialist using fullness (closer to original sound)",
+                "model_bs_roformer_ep_317_sdr_12.9755.ckpt": "Note: 1297 has slightly higher SDR but may add ultra-high freq noise",
+                "model_bs_roformer_ep_368_sdr_12.9628.ckpt": "1296 has slightly lower SDR but no ultra-high freq noise",
+                "big_beta5e.ckpt": "Very large model, highest fullness score for vocals (more noise)",
+                "kimmel_unwa_ft2_bleedless.ckpt": "Kim model fine-tune, highest vocal bleedless score(39.30), slightly lower SDR/fullness"
             },
             "kara_models": {
-                "None": "Do not use harmony separation",
-                "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt": "\u3010Aggressive\u3011 But performs much better than existing UVR models"
+                "None": "Disable harmony separation",
+                "bs_roformer_karaoke_frazer_becruily.ckpt": "[Rec] Handles close harmonies well, conservative but good lead vocal detection",
+                "mel_band_roformer_karaoke_becruily.ckpt": "Aggressive, better at separating harmonies, fuller sound",
+                "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt": "Aggressive, best performance, use reverb module if vocals damaged",
+                "kar_gabox.ckpt": "Slightly conservative, similar performance, better with high pitches"
             },
             "reverb_models": {
-                "None": "Do not use reverb and harmony separation",
-                "dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt": "\u3010Recommended\u3011 Currently the highest SDR score",
-                "dereverb_mel_band_roformer_less_aggressive_anvuew_sdr_18.8050.ckpt": "Less aggressive than the recommended model",
-                "deverb_bs_roformer_8_384dim_10depth.ckpt": "New bs model trained with more data, higher SDR, more conservative in harmony separation than mel series",
+                "None": "Disable reverb/harmony separation",
+                "dereverb_mel_band_roformer_mono_anvuew_sdr_20.4029.ckpt": "[Rec] Highest SDR mono reverb removal, poor for harmonies",
+                "dereverb_room_anvuew_sdr_13.7432.ckpt": "[Rec] Mono room reverb specialist, drier sound (mono input only)",
+                "dereverb_echo_mbr_fused_0.5_v2_0.25_big_0.25_super.ckpt": "[Rec] Best for delay/echo removal, better with heavy reverb",
+                "dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt": "Previous best SDR, good harmony removal",
+                "dereverb_mel_band_roformer_less_aggressive_anvuew_sdr_18.8050.ckpt": "Less aggressive than 1917, use if vocals damaged",
+                "deverb_bs_roformer_8_384dim_10depth.ckpt": "New bs model, higher SDR, conservative on harmonies",
                 "deverb_bs_roformer_8_256dim_8depth.ckpt": "Old bs model",
-                "deverb_mel_band_roformer_8_256dim_6depth.ckpt": "Very aggressive dereverberation, may strip vocals depending on the song",
-                "deverb_mel_band_roformer_8_512dim_12depth.ckpt": "Larger network than the 8_256_6 version, slightly higher SDR but 3x inference time",
-                "deverb_mel_band_roformer_ep_27_sdr_10.4567.ckpt": "Initial version, good balance between dereverberation and deharmonization"
+                "deverb_mel_band_roformer_8_256dim_6depth.ckpt": "Very aggressive, may damage vocals",
+                "deverb_mel_band_roformer_8_512dim_12depth.ckpt": "Larger network, slightly higher SDR, 3x slower",
+                "deverb_mel_band_roformer_ep_27_sdr_10.4567.ckpt": "Original model, balanced reverb/harmony removal"
             },
             "other_models": {
-                "None": "Do not use other models",
-                "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt": "\u3010Denoise\u3011Use the normal version model with SDR 27.9959",
-                "denoise_mel_band_roformer_aufr33_aggr_sdr_27.9768.ckpt": "\u3010Denoise\u3011Use the aggressive version model with SDR 27.9768",
-                "Apollo_LQ_MP3_restoration.ckpt": "\u3010Restoration\u3011Enhancing MP3 audio quality, restoring it to 44.1 kHz",
-                "aspiration_mel_band_roformer_sdr_18.9845.ckpt": "\u3010Aspiration\u3011Aspiration Separation Model",
-                "aspiration_mel_band_roformer_less_aggr_sdr_18.1201.ckpt": "\u3010Aspiration\u3011Less aggr aspiration Separation Model",
-                "mel_band_roformer_crowd_aufr33_viperx_sdr_8.7144.ckpt": "\u3010Crowd\u3011Remove some noisy background crowd sounds, but it will reduce the audio quality."
+                "None": "Disable other modules",
+                "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt": "[Denoise] Standard version SDR 27.9959",
+                "denoise_mel_band_roformer_aufr33_aggr_sdr_27.9768.ckpt": "[Denoise] Aggressive version SDR 27.9768",
+                "model_bandit_plus_dnr_sdr_11.47.chpt": "[Denoise] Removes mouse/keyboard/effects, may remove lead vocals",
+                "bleed_suppressor_v1.ckpt": "[Denoise] Suppresses leakage for fullness models",
+                "Apollo_LQ_MP3_restoration.ckpt": "[Restore] MP3 quality restoration to 44.1 kHz",
+                "aspiration_mel_band_roformer_sdr_18.9845.ckpt": "[Breath] Separates breath sounds",
+                "aspiration_mel_band_roformer_less_aggr_sdr_18.1201.ckpt": "[Breath] Less aggressive breath separation",
+                "mel_band_roformer_crowd_aufr33_viperx_sdr_8.7144.ckpt": "[Denoise] Background speech separation, affects quality",
+                "bs_roformer_male_female_by_aufr33_sdr_7.2889.ckpt": "[Separation] Separates simultaneous male/female speech"
             },
             "config_paths": {
                 "MelBandRoformer_kim.ckpt": [
@@ -155,6 +172,70 @@ def load_or_create_config():
                 "mel_band_roformer_crowd_aufr33_viperx_sdr_8.7144.ckpt": [
                     "configs/model_mel_band_roformer_crowd_aufr33_viperx.yaml",
                     "configs/model_mel_band_roformer_crowd_aufr33_viperx-fast.yaml"
+                ],
+                "mel_band_roformer_vocals_becruily.ckpt": [
+                    "configs/config_vocals_becruily.yaml",
+                    "configs/config_vocals_becruily-fast.yaml"
+                ],
+                "inst_v1e.ckpt": [
+                    "configs/config_melbandroformer_inst.yaml",
+                    "configs/config_melbandroformer_inst-fast.yaml"
+                ],
+                "big_beta5e.ckpt": [
+                    "configs/big_beta5e.yaml",
+                    "configs/big_beta5e-fast.yaml"
+                ],
+                "bleed_suppressor_v1.ckpt": [
+                    "configs/config_bleed_suppressor_v1.yaml",
+                    "configs/config_bleed_suppressor_v1-fast.yaml"
+                ],
+                "dereverb_echo_mbr_fused_0.5_v2_0.25_big_0.25_super.ckpt": [
+                    "configs/config_dereverb_echo_mbr_v2.yaml",
+                    "configs/config_dereverb_echo_mbr_v2-fast.yaml"
+                ],
+                "dereverb_mel_band_roformer_mono_anvuew_sdr_20.4029.ckpt": [
+                    "configs/dereverb_mel_band_roformer_anvuew.yaml",
+                    "configs/dereverb_mel_band_roformer_anvuew-fast.yaml"
+                ],
+                "bs_roformer_male_female_by_aufr33_sdr_7.2889.ckpt": [
+                    "configs/config_chorus_male_female_bs_roformer.yaml",
+                    "configs/config_chorus_male_female_bs_roformer-fast.yaml"
+                ],
+                "kar_gabox.ckpt": [
+                    "configs/config_mel_band_roformer_karaoke.yaml",
+                    "configs/config_mel_band_roformer_karaoke-fast.yaml"
+                ],
+                "model_bandit_plus_dnr_sdr_11.47.chpt": [
+                    "configs/config_dnr_bandit_bsrnn_multi_mus64.yaml",
+                    "configs/config_dnr_bandit_bsrnn_multi_mus64-fast.yaml"
+                ],
+                "kimmel_unwa_ft2_bleedless.ckpt": [
+                    "configs/config_kimmel_unwa_ft.yaml",
+                    "configs/config_kimmel_unwa_ft-fast.yaml"
+                ],
+                "mel_band_roformer_karaoke_becruily.ckpt": [
+                    "configs/config_karaoke_becruily.yaml",
+                    "configs/config_karaoke_becruily-fast.yaml"
+                ],
+                "BS_ResurrectioN.ckpt": [
+                    "configs/BS-Roformer-Resurrection-Inst-Config.yaml",
+                    "configs/BS-Roformer-Resurrection-Inst-Config-fast.yaml"
+                ],
+                "logic_roformer.pt": [
+                    "configs/logic_pro_config_v1.yaml",
+                    "configs/logic_pro_config_v1-fast.yaml"
+                ],
+                "bs_roformer_karaoke_frazer_becruily.ckpt": [
+                    "configs/config_karaoke_frazer_becruily.yaml",
+                    "configs/config_karaoke_frazer_becruily-fast.yaml"
+                ],
+                "dereverb_room_anvuew_sdr_13.7432.ckpt": [
+                    "configs/dereverb_room_anvuew.yaml",
+                    "configs/dereverb_room_anvuew-fast.yaml"
+                ],
+                "BS-Roformer-Resurrection.ckpt": [
+                    "configs/BS-Roformer-Resurrection-Config.yaml",
+                    "configs/BS-Roformer-Resurrection-Config-fast.yaml"
                 ]
             },
             "model_types": {
@@ -174,39 +255,178 @@ def load_or_create_config():
                 "Apollo_LQ_MP3_restoration.ckpt": "apollo",
                 "aspiration_mel_band_roformer_sdr_18.9845.ckpt": "mel_band_roformer",
                 "aspiration_mel_band_roformer_less_aggr_sdr_18.1201.ckpt": "mel_band_roformer",
-                "mel_band_roformer_crowd_aufr33_viperx_sdr_8.7144.ckpt": "mel_band_roformer"
+                "mel_band_roformer_crowd_aufr33_viperx_sdr_8.7144.ckpt": "mel_band_roformer",
+                "mel_band_roformer_vocals_becruily.ckpt": "mel_band_roformer",
+                "inst_v1e.ckpt": "mel_band_roformer",
+                "big_beta5e.ckpt": "mel_band_roformer",
+                "bleed_suppressor_v1.ckpt": "mel_band_roformer",
+                "dereverb_echo_mbr_fused_0.5_v2_0.25_big_0.25_super.ckpt": "mel_band_roformer",
+                "dereverb_mel_band_roformer_mono_anvuew_sdr_20.4029.ckpt": "mel_band_roformer",
+                "bs_roformer_male_female_by_aufr33_sdr_7.2889.ckpt": "bs_roformer",
+                "kar_gabox.ckpt": "mel_band_roformer",
+                "model_bandit_plus_dnr_sdr_11.47.chpt": "bandit",
+                "kimmel_unwa_ft2_bleedless.ckpt": "mel_band_roformer",
+                "mel_band_roformer_karaoke_becruily.ckpt": "mel_band_roformer",
+                "BS_ResurrectioN.ckpt": "bs_roformer",
+                "logic_roformer.pt": "bs_roformer",
+                "bs_roformer_karaoke_frazer_becruily.ckpt": "bs_roformer",
+                "dereverb_room_anvuew_sdr_13.7432.ckpt": "bs_roformer",
+                "BS-Roformer-Resurrection.ckpt": "bs_roformer"
+            },
+            "main_tracks": {
+                "BS_ResurrectioN.ckpt": "instrumental",
+                "logic_roformer.pt": "vocals",
+                "bs_roformer_karaoke_frazer_becruily.ckpt": "Vocals",
+                "dereverb_room_anvuew_sdr_13.7432.ckpt": "noreverb",
+                "MelBandRoformer_kim.ckpt": "vocals",
+                "mel_band_roformer_vocals_becruily.ckpt": "vocals",
+                "inst_v1e.ckpt": "instrumental",
+                "model_bs_roformer_ep_317_sdr_12.9755.ckpt": "Vocals",
+                "model_bs_roformer_ep_368_sdr_12.9628.ckpt": "Vocals",
+                "big_beta5e.ckpt": "vocals",
+                "kimmel_unwa_ft2_bleedless.ckpt": "vocals",
+                "mel_band_roformer_karaoke_becruily.ckpt": "Vocals",
+                "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt": "karaoke",
+                "kar_gabox.ckpt": "karaoke",
+                "dereverb_mel_band_roformer_mono_anvuew_sdr_20.4029.ckpt": "noreverb",
+                "dereverb_echo_mbr_fused_0.5_v2_0.25_big_0.25_super.ckpt": "dry",
+                "dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt": "noreverb",
+                "dereverb_mel_band_roformer_less_aggressive_anvuew_sdr_18.8050.ckpt": "noreverb",
+                "deverb_bs_roformer_8_384dim_10depth.ckpt": "noreverb",
+                "deverb_bs_roformer_8_256dim_8depth.ckpt": "noreverb",
+                "deverb_mel_band_roformer_8_256dim_6depth.ckpt": "noreverb",
+                "deverb_mel_band_roformer_8_512dim_12depth.ckpt": "noreverb",
+                "deverb_mel_band_roformer_ep_27_sdr_10.4567.ckpt": "noreverb",
+                "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt": "dry",
+                "denoise_mel_band_roformer_aufr33_aggr_sdr_27.9768.ckpt": "dry",
+                "model_bandit_plus_dnr_sdr_11.47.chpt": "speech",
+                "bleed_suppressor_v1.ckpt": "instrumental",
+                "Apollo_LQ_MP3_restoration.ckpt": "restored",
+                "aspiration_mel_band_roformer_sdr_18.9845.ckpt": "other",
+                "aspiration_mel_band_roformer_less_aggr_sdr_18.1201.ckpt": "other",
+                "mel_band_roformer_crowd_aufr33_viperx_sdr_8.7144.ckpt": "instrumental",
+                "bs_roformer_male_female_by_aufr33_sdr_7.2889.ckpt": "female",
+                "BS-Roformer-Resurrection.ckpt": "vocals"
             },
             "inference_env": ".\\env\\python.exe"
         }
         with open(CONFIG_FILE, 'w') as f:
-            json.dump(initial_config, f, indent=4)
+            json.dump(initial_config, f, ensure_ascii=False, indent=4)
 
     with open(CONFIG_FILE, 'r') as f:
         return json.load(f)
 
 
-def organize_instrumental_files(store_dir):
+def organize_instrumental_files(store_dir, main_track):
+    if not os.path.exists(store_dir):
+        return 0, 0.0
+
+    moved_files = 0
+    start_time = time.time()
+
     instrumental_dir = os.path.join(store_dir, "instrumental")
     if not os.path.exists(instrumental_dir):
         os.makedirs(instrumental_dir)
 
-    moved_files = 0
-    start_time = time.time()
-    inst_lower = ['_instrumental', '_aspiration']
+    for item in os.listdir(store_dir):
+        item_path = os.path.join(store_dir, item)
 
-    for filename in os.listdir(store_dir):
-        for lower in inst_lower:
-            if lower in filename.lower():
-                src_path = os.path.join(store_dir, filename)
-                dst_path = os.path.join(instrumental_dir, filename)
-                shutil.move(src_path, dst_path)
-                moved_files += 1
+        if os.path.isdir(item_path) and item != "instrumental":
+            audio_name = item
+
+            for track_file in os.listdir(item_path):
+                if track_file.endswith(('.wav', '.mp3', '.flac')):
+                    track_name = os.path.splitext(track_file)[0]
+                    src_path = os.path.join(item_path, track_file)
+                    new_filename = f"{audio_name}_{track_file}"
+
+                    if track_name == main_track:
+                        dst_path = os.path.join(store_dir, new_filename)
+                    else:
+                        audio_instrumental_dir = os.path.join(instrumental_dir, audio_name)
+                        if not os.path.exists(audio_instrumental_dir):
+                            os.makedirs(audio_instrumental_dir)
+                        dst_path = os.path.join(audio_instrumental_dir, new_filename)
+
+                    try:
+                        shutil.move(src_path, dst_path)
+                        moved_files += 1
+                    except (PermissionError, OSError) as e:
+                        logger.warning(f"Unable to move the file {src_path}: {str(e)}")
+            try:
+                if not os.listdir(item_path):
+                    os.rmdir(item_path)
+            except OSError:
+                pass  # The directory may not be empty or cannot be deleted, temporarily retained.
 
     end_time = time.time()
-    logger.info(f"Organized {moved_files} instrumental files in {store_dir}")
-    logger.info(f"Time taken to organize files: {end_time - start_time:.2f} seconds")
-
+    logger.info(f"Sorting completed: organized {moved_files} instrumental files in {end_time - start_time:.2f} s")
     return moved_files, end_time - start_time
+
+
+class ScalingUtils:
+    @staticmethod
+    def get_scaling_factor():
+        try:
+            screen = QApplication.primaryScreen()
+            if screen:
+                dpi = screen.logicalDotsPerInch()
+                # Calculate the scaling_factor based on 96 DPI (100%)
+                scaling_factor = dpi / 96.0
+                return max(0.5, min(3.0, scaling_factor))
+        except:
+            pass
+        return 1.0
+
+    @staticmethod
+    def scale_size(size, scaling_factor):
+        return int(round(size * scaling_factor))
+
+    @staticmethod
+    def scale_font(font, scaling_factor):
+        scaled_font = QFont(font)
+        if scaling_factor != 1.0:
+            new_size = max(8, int(round(font.pointSizeF() * scaling_factor)))
+            scaled_font.setPointSize(new_size)
+        return scaled_font
+
+    @staticmethod
+    def scale_stylesheet(stylesheet, scaling_factor=None):
+        if scaling_factor is None:
+            scaling_factor = ScalingUtils.get_scaling_factor()
+
+        if scaling_factor == 1.0:
+            return stylesheet
+
+        pattern = r'(?<!padding)(?<!padding-top)(?<!padding-right)(?<!padding-bottom)(?<!padding-left)(?<!-)\s*:\s*(\d+)(px|pt|em|ex|%|in|cm|mm|pc)'
+
+        def scale_match(match):
+            full_match = match.group(0)
+            original_size = int(match.group(1))
+            unit = match.group(2)
+
+            if unit == 'px':
+                scaled_size = ScalingUtils.scale_size(original_size, scaling_factor)
+                return re.sub(r'\d+' + unit, f"{scaled_size}{unit}", full_match)
+            else:
+                return full_match
+
+        scaled_stylesheet = re.sub(pattern, scale_match, stylesheet)
+        compound_pattern = r'(?<!padding)(?<!padding-top)(?<!padding-right)(?<!padding-bottom)(?<!padding-left)(?<!-)\s*:\s*(\d+)px\s+(\d+)px'
+
+        def scale_compound_match(match):
+            full_match = match.group(0)
+            size1 = ScalingUtils.scale_size(int(match.group(1)), scaling_factor)
+            size2 = ScalingUtils.scale_size(int(match.group(2)), scaling_factor)
+            return re.sub(r'\d+px\s+\d+px', f"{size1}px {size2}px", full_match)
+
+        scaled_stylesheet = re.sub(compound_pattern, scale_compound_match, scaled_stylesheet)
+        return scaled_stylesheet
+
+    @staticmethod
+    def set_scaled_stylesheet(widget, stylesheet, scaling_factor=None):
+        scaled_stylesheet = ScalingUtils.scale_stylesheet(stylesheet, scaling_factor)
+        widget.setStyleSheet(scaled_stylesheet)
 
 
 class SystemInfoThread(QThread):
@@ -309,12 +529,12 @@ class SystemInfoThread(QThread):
 
             pynvml.nvmlShutdown()
         except Exception as e:
-            gpu_warning = f"Error detecting GPU: {str(e)}. Please use CPU for inference."
+            gpu_warning = f"检测显卡时出错: {str(e)}. \n请开启CPU推理"
 
         self.print_with_delay(gpu_info, color='#ffc0cb')
         self.print_with_delay("=" * 50, color='gray')
-        self.print_with_delay(gpu_warning, color='#ffa500', italic=True)
-        self.print_with_delay(ram_warning, color='#ffa500', italic=True)
+        self.print_with_delay(gpu_warning, color='#ffa500')
+        self.print_with_delay(ram_warning, color='#ffa500')
         self.print_with_delay("=" * 50, color='gray')
         self.print_with_delay("Github: https://github.com/AliceNavigator/Music-Source-Separation-Training-GUI", color='green', auto_newline=False)
 
@@ -384,7 +604,7 @@ class InferenceThread(QThread):
             if not self.is_running:
                 break
             logger.info(f"Starting inference with command: {command}")
-            self.update_signal.emit(f"MODULE: {module_names[store_dir]}", False)
+            self.update_signal.emit(f"Module: {module_names[store_dir]}", False)
             self.update_signal.emit(f"Command: {command}", False)
             env_path = self.extract_env_path(command)
             new_paths = f'{env_path}Scripts;{env_path}bin;{env_path};'
@@ -408,10 +628,10 @@ class InferenceThread(QThread):
                 summary["modules"].append((module_names[store_dir], store_dir))
                 logger.info(f"Module {module_names[store_dir]} completed. ")
 
-                # Make sure all files are organized before continuing
-                moved_files, time_taken = organize_instrumental_files(store_dir)
+                model_name = self.get_current_model_name(command)
+                main_track = self.get_main_track_for_model(model_name)
+                moved_files, time_taken = organize_instrumental_files(store_dir, main_track)
                 self.file_organization_signal.emit(moved_files, time_taken)
-
             else:
                 self.terminate_process()
             logger.info(f"Inference process completed or terminated for {module_names[store_dir]}")
@@ -423,6 +643,31 @@ class InferenceThread(QThread):
             self.finished_signal.emit(summary)
         else:
             self.update_signal.emit("Inference process was terminated.", False)
+
+    @staticmethod
+    def get_current_model_name(command):
+        # Match paths with quotes (can handle spaces)
+        quoted_match = re.search(r'--start_check_point\s+[\'"]([^\'"]+)[\'"]', command)
+        if quoted_match:
+            return os.path.basename(quoted_match.group(1))
+
+        # Match paths without quotes (cannot handle spaces)
+        unquoted_match = re.search(r'--start_check_point\s+([^\s\'"]+)', command)
+        if unquoted_match:
+            return os.path.basename(unquoted_match.group(1))
+        return None
+
+    @staticmethod
+    def get_main_track_for_model(model_name):
+        if not model_name or model_name == "None":
+            return "vocals"  # Default
+
+        config = load_or_create_config()
+        main_tracks = config.get("main_tracks", {})
+        if model_name in main_tracks:
+            return main_tracks[model_name]
+
+        return "vocals"
 
     def stop(self):
         self.is_running = False
@@ -449,6 +694,7 @@ class InferenceThread(QThread):
 class ModelEditDialog(QDialog):
     def __init__(self, model_name, model_info, config, parent=None):
         super().__init__(parent)
+        self.main_track_edit = None
         self.cancel_button = None
         self.save_button = None
         self.model_type_edit = None
@@ -459,7 +705,12 @@ class ModelEditDialog(QDialog):
         self.model_info = model_info
         self.config = config
         self.setWindowTitle(f"Edit Model: {model_name}")
-        self.setGeometry(100, 100, 800, 500)
+        self.scaling_factor = ScalingUtils.get_scaling_factor()
+        base_width = 800
+        base_height = 500
+        scaled_width = ScalingUtils.scale_size(base_width, self.scaling_factor)
+        scaled_height = ScalingUtils.scale_size(base_height, self.scaling_factor)
+        self.setGeometry(100, 100, scaled_width, scaled_height)
         self.setup_ui()
 
     def setup_ui(self):
@@ -467,25 +718,24 @@ class ModelEditDialog(QDialog):
         layout.setSpacing(20)
         layout.setContentsMargins(30, 30, 30, 30)
 
-        title_label = QLabel(f"Edit Model: {self.model_name}")
-        title_label.setStyleSheet("font-size: 20px; font-weight: bold; color: #333;")
-        layout.addWidget(title_label)
-
         form_layout = QFormLayout()
         form_layout.setSpacing(15)
 
         self.description_edit = QTextEdit(self.model_info)
         self.description_edit.setFixedHeight(100)
-        form_layout.addRow(self.create_label("Description:"), self.description_edit)
+        form_layout.addRow(QLabel("Description:"), self.description_edit)
 
         self.config_path_edit = QLineEdit(self.config.get("config_paths", {}).get(self.model_name, ["", ""])[0])
-        form_layout.addRow(self.create_label("Config Path:"), self.config_path_edit)
+        form_layout.addRow(QLabel("Config Path:"), self.config_path_edit)
 
         self.fast_config_path_edit = QLineEdit(self.config.get("config_paths", {}).get(self.model_name, ["", ""])[1])
-        form_layout.addRow(self.create_label("Fast Config Path:"), self.fast_config_path_edit)
+        form_layout.addRow(QLabel("Fast Config Path:"), self.fast_config_path_edit)
 
         self.model_type_edit = QLineEdit(self.config.get("model_types", {}).get(self.model_name, ""))
-        form_layout.addRow(self.create_label("Model Type:"), self.model_type_edit)
+        form_layout.addRow(QLabel("Model Type:"), self.model_type_edit)
+
+        self.main_track_edit = QLineEdit(self.config.get("main_tracks", {}).get(self.model_name, ""))
+        form_layout.addRow(QLabel("Target track:"), self.main_track_edit)
 
         layout.addLayout(form_layout)
 
@@ -493,7 +743,8 @@ class ModelEditDialog(QDialog):
         <b>Description:</b> A brief explanation of the model's purpose or characteristics.<br>
         <b>Config Path:</b> The path to the model's configuration file for normal inference.<br>
         <b>Fast Config Path:</b> The path to the model's configuration file for fast inference mode.<br>
-        <b>Model Type:</b> The type of the model (e.g., mel_band_roformer, bs_roformer).
+        <b>Model Type:</b> The type of the model (e.g., mel_band_roformer, bs_roformer).<br>
+        <b>Target track:</b> The name of the target track output by this model, used to determine the input track for cascaded inference. If left blank, "vocals" will be used.
         """
         explanation_label = QLabel(explanation_text)
         explanation_label.setWordWrap(True)
@@ -506,8 +757,8 @@ class ModelEditDialog(QDialog):
         button_layout.setContentsMargins(0, 0, 0, 0)
         button_layout.setSpacing(10)
 
-        self.save_button = self.create_styled_button("Save")
-        self.cancel_button = self.create_styled_button("Cancel")
+        self.save_button = QPushButton("Save")
+        self.cancel_button = QPushButton("Cancel")
         self.save_button.clicked.connect(self.accept)
         self.cancel_button.clicked.connect(self.reject)
 
@@ -516,49 +767,24 @@ class ModelEditDialog(QDialog):
 
         layout.addWidget(button_widget, 0, Qt.AlignRight | Qt.AlignBottom)
 
-        self.setStyleSheet("""
-            QDialog {
+        model_edit_dialog_stylesheet = """
+            ModelEditDialog {
                 background-color: #ffffff;
                 border-radius: 10px;
             }
-            QLabel {
+            ModelEditDialog QLabel {
                 font-size: 14px;
                 color: #333;
             }
-            QLineEdit, QTextEdit {
+            ModelEditDialog QLineEdit, ModelEditDialog QTextEdit {
                 border: 1px solid #ddd;
                 border-radius: 5px;
-                padding: 8px;
+                padding: 4px;
                 background-color: #f9f9f9;
                 font-size: 14px;
+                color: #333;
             }
-            QPushButton {
-                background-color: #4a90e2;
-                color: white;
-                border: none;
-                padding: 10px 20px;
-                text-align: center;
-                text-decoration: none;
-                font-size: 14px;
-                border-radius: 5px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #357abd;
-            }
-        """)
-
-    @staticmethod
-    def create_label(text):
-        label = QLabel(text)
-        label.setStyleSheet("font-weight: bold; color: #333;")
-        return label
-
-    @staticmethod
-    def create_styled_button(text):
-        button = QPushButton(text)
-        button.setStyleSheet("""
-            QPushButton {
+            ModelEditDialog QPushButton {
                 background-color: #4a90e2;
                 color: white;
                 border: none;
@@ -569,21 +795,23 @@ class ModelEditDialog(QDialog):
                 border-radius: 4px;
                 min-width: 80px;
             }
-            QPushButton:hover {
-                background-color: #357abd;
+            ModelEditDialog QPushButton:hover {
+            background-color: #357abd;
             }
-            QPushButton:pressed {
-                background-color: #2a5d8b;
+            ModelEditDialog QPushButton:pressed {
+            background-color: #2a5d8b;
             }
-        """)
-        return button
+        """
+        ScalingUtils.set_scaled_stylesheet(self, model_edit_dialog_stylesheet, self.scaling_factor)
+        MainWindow.center_on_screen(self)
 
     def get_updated_info(self):
         return {
             "description": self.description_edit.toPlainText(),
             "config_path": self.config_path_edit.text(),
             "fast_config_path": self.fast_config_path_edit.text(),
-            "model_type": self.model_type_edit.text()
+            "model_type": self.model_type_edit.text(),
+            "main_track": self.main_track_edit.text()
         }
 
 
@@ -598,7 +826,12 @@ class ConfigEditorDialog(QDialog):
         self.working_config = copy.deepcopy(self.original_config)
         self.working_config = self.validate_config(self.working_config)
         self.setWindowTitle("Model Configuration Editor")
-        self.setGeometry(100, 100, 1000, 600)
+        self.scaling_factor = ScalingUtils.get_scaling_factor()
+        base_width = 1000
+        base_height = 600
+        scaled_width = ScalingUtils.scale_size(base_width, self.scaling_factor)
+        scaled_height = ScalingUtils.scale_size(base_height, self.scaling_factor)
+        self.setGeometry(100, 100, scaled_width, scaled_height)
         self.setup_ui()
 
     @staticmethod
@@ -654,6 +887,7 @@ class ConfigEditorDialog(QDialog):
             button_layout.addWidget(self.cancel_button)
 
             layout.addWidget(button_widget, 0, Qt.AlignRight | Qt.AlignBottom)
+            MainWindow.center_on_screen(self)
 
         except Exception as e:
             logger.error(f"Error in setup_ui: {str(e)}")
@@ -725,10 +959,9 @@ class ConfigEditorDialog(QDialog):
         button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         return button
 
-    @staticmethod
-    def create_styled_button(text):
+    def create_styled_button(self, text):
         button = QPushButton(text)
-        button.setStyleSheet("""
+        button_stylesheet = """
             QPushButton {
                 background-color: #4CAF50;
                 color: white;
@@ -746,7 +979,8 @@ class ConfigEditorDialog(QDialog):
             QPushButton:pressed {
                 background-color: #3d8b3d;
             }
-        """)
+        """
+        ScalingUtils.set_scaled_stylesheet(self, button_stylesheet, self.scaling_factor)
         return button
 
     def move_row(self, table, row, model_type, direction):
@@ -804,6 +1038,9 @@ class ConfigEditorDialog(QDialog):
                 if "model_types" not in self.working_config:
                     self.working_config["model_types"] = {}
                 self.working_config["model_types"][model_name] = updated_info["model_type"]
+                if "main_tracks" not in self.working_config:
+                    self.working_config["main_tracks"] = {}
+                self.working_config["main_tracks"][model_name] = updated_info["main_track"]
                 table.setItem(row, 1, QTableWidgetItem(updated_info["description"]))
                 logger.info(f"Edited model {model_name} in {model_type}")
         except Exception as e:
@@ -845,6 +1082,9 @@ class ConfigEditorDialog(QDialog):
                     if "model_types" not in self.working_config:
                         self.working_config["model_types"] = {}
                     self.working_config["model_types"][model_name] = updated_info["model_type"]
+                    if "main_tracks" not in self.working_config:
+                        self.working_config["main_tracks"] = {}
+                    self.working_config["main_tracks"][model_name] = updated_info["main_track"]
                     self.add_row_to_table(table, model_name, updated_info["description"], model_type)
                     self.update_config_from_table(table, model_type)
                     logger.info(f"Added new model {model_name} to {model_type}")
@@ -860,7 +1100,7 @@ class ConfigEditorDialog(QDialog):
             self.original_config.clear()
             self.original_config.update(copy.deepcopy(self.working_config))
             with open(CONFIG_FILE, 'w') as f:
-                json.dump(self.original_config, f, indent=4)
+                json.dump(self.original_config, f, ensure_ascii=False, indent=4)
             logger.info("Configuration saved successfully")
             self.accept()
         except Exception as e:
@@ -890,7 +1130,7 @@ class ConfigEditorDialog(QDialog):
         self.setAttribute(Qt.WA_StyledBackground, True)
 
     def apply_styles(self):
-        self.setStyleSheet("""
+        config_editor_dialog_stylesheet = """
             QDialog { background-color: #ffffff; }
             QTabWidget::tab-bar { left: 5px; }
             QTabWidget::pane {
@@ -932,7 +1172,8 @@ class ConfigEditorDialog(QDialog):
                 border-radius: 3px;
             }
             QPushButton:hover, QToolButton:hover { background-color: #45a049; }
-        """)
+        """
+        ScalingUtils.set_scaled_stylesheet(self, config_editor_dialog_stylesheet, self.scaling_factor)
 
 
 class MainWindow(QMainWindow):
@@ -940,13 +1181,23 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.background_label = None
         self.inference_thread = None
-        self.setWindowTitle("MSST GUI v1.3.1     by 领航员未鸟")
-        self.setGeometry(100, 100, 800, 800)
+        self.setWindowTitle("MSST GUI v1.4     by 领航员未鸟")
+        self.scaling_factor = ScalingUtils.get_scaling_factor()
+        logger.info(f"Detected scaling factor: {self.scaling_factor}")
+        base_width = 800
+        base_height = 810
+        scaled_width = ScalingUtils.scale_size(base_width, self.scaling_factor)
+        scaled_height = ScalingUtils.scale_size(base_height, self.scaling_factor)
+        self.setGeometry(100, 100, scaled_width, scaled_height)
+        self.base_font = QApplication.font()
+        scaled_font = ScalingUtils.scale_font(self.base_font, self.scaling_factor)
+        QApplication.setFont(scaled_font)
+        logger.info(f"Applied font scaling: {self.base_font.pointSize()}pt -> {scaled_font.pointSize()}pt")
         self.setWindowIcon(QIcon(":/images/msst-icon.ico"))
-        self.setFont(QApplication.font())
+
         if sys.platform == 'win32':
             import ctypes
-            myappid = 'AliceNavigator.msst-GUI.v1.3.1'
+            myappid = 'AliceNavigator.MSST-GUI.v1.4'
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
 
         self.config = load_or_create_config()
@@ -1014,7 +1265,7 @@ class MainWindow(QMainWindow):
         options_layout.setSpacing(20)  # Increase overall spacing between main elements
 
         left_options = QHBoxLayout()
-        left_options.setSpacing(60)  # Increase spacing between checkboxes
+        left_options.setSpacing(78)  # Increase spacing between checkboxes
 
         self.fast_inference_checkbox = QCheckBox("Fast Inference Mode")
         self.fast_inference_checkbox.setToolTip(
@@ -1083,24 +1334,26 @@ class MainWindow(QMainWindow):
         self.open_folder_button.setIconSize(QSize(24, 24))
         self.open_folder_button.setToolTip("Open Input Folder")
         self.open_folder_button.clicked.connect(self.open_input_folder)
-        self.open_folder_button.setStyleSheet("""
+        open_folder_button_stylesheet = """
             QToolButton {
                 padding-left: 1px;
             }
-        """)
+        """
+        ScalingUtils.set_scaled_stylesheet(self, open_folder_button_stylesheet, self.scaling_factor)
         folder_layout.addWidget(self.open_folder_button)
 
         # button to open the archive folder
         self.open_archive_button = QToolButton()
-        self.open_archive_button.setIcon(QIcon(":/images/document-folder.png"))
+        self.open_archive_button.setIcon(QIcon(":/images/document-folder"))
         self.open_archive_button.setIconSize(QSize(24, 24))
         self.open_archive_button.setToolTip("Open Archive Folder")
         self.open_archive_button.clicked.connect(self.open_archive_folder)
-        self.open_archive_button.setStyleSheet("""
-                    QToolButton {
-                        padding-left: 1px;
-                    }
-                """)
+        open_archive_button_stylesheet = """
+                            QToolButton {
+                                padding-left: 1px;
+                            }
+                        """
+        ScalingUtils.set_scaled_stylesheet(self, open_archive_button_stylesheet, self.scaling_factor)
         folder_layout.addWidget(self.open_archive_button)
 
         main_layout.addLayout(folder_layout)
@@ -1124,7 +1377,7 @@ class MainWindow(QMainWindow):
         # Output console
         self.output_console = QTextEdit()
         self.output_console.setReadOnly(True)
-        self.output_console.setStyleSheet("""
+        console_stylesheet = """
             QTextEdit {
                 background-color: #1e1e1e;
                 color: #ffffff;
@@ -1132,11 +1385,12 @@ class MainWindow(QMainWindow):
                 font-size: 12px;
                 border: 1px solid #3a3a3a;
             }
-        """)
+        """
+        ScalingUtils.set_scaled_stylesheet(self, console_stylesheet, self.scaling_factor)
         self.set_background_image()
-        font = QFont("Microsoft YaHei Mono", 10)
+        font = QFont("Microsoft YaHei Mono", ScalingUtils.scale_size(10, self.scaling_factor))
         if not QFontInfo(font).fixedPitch():
-            font = QFont("Noto Sans Mono CJK SC", 10)
+            font = QFont("Noto Sans Mono CJK SC", ScalingUtils.scale_size(10, self.scaling_factor))
 
         if not QFontInfo(font).fixedPitch():
             # use sys default font if cant find any
@@ -1164,7 +1418,7 @@ class MainWindow(QMainWindow):
         self.update_tooltip(self.other_model_combo, self.other_model_tooltip)
 
         # Set styles
-        self.setStyleSheet("""
+        main_stylesheet = """
             QMainWindow {
                 background-color: #f0f0f0;
             }
@@ -1275,8 +1529,9 @@ class MainWindow(QMainWindow):
             QCheckBox {
                 font-size: 12px;
             }
-        """)
-
+        """
+        ScalingUtils.set_scaled_stylesheet(self, main_stylesheet, self.scaling_factor)
+        self.center_on_screen()
         logger.info("MainWindow initialization completed")
 
     def check_inference_env(self):
@@ -1304,7 +1559,7 @@ class MainWindow(QMainWindow):
 
     def save_env_config(self):
         with open(CONFIG_FILE, 'w') as f:
-            json.dump(self.config, f, indent=4)
+            json.dump(self.config, f, ensure_ascii=False, indent=4)
         logger.info("Inference env configuration saved")
 
     @staticmethod
@@ -1315,16 +1570,15 @@ class MainWindow(QMainWindow):
             combo.setItemData(i, tooltip, Qt.ToolTipRole)
         return combo
 
-    @staticmethod
-    def create_tooltip_label():
+    def create_tooltip_label(self):
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
-        scroll_area.setMaximumHeight(25)
+        scroll_area.setMaximumHeight(ScalingUtils.scale_size(25, self.scaling_factor))
         scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
         label = QLabel()
         label.setWordWrap(True)
-        label.setStyleSheet("""
+        label_stylesheet = """
             QLabel {
                 background-color: #d0f0c0;
                 border: 1px solid #cccccc;
@@ -1333,7 +1587,8 @@ class MainWindow(QMainWindow):
                 font-size: 11px;
                 color: #333333;
             }
-        """)
+        """
+        ScalingUtils.set_scaled_stylesheet(self, label_stylesheet, self.scaling_factor)
 
         scroll_area.setWidget(label)
         scroll_area.setStyleSheet("""
@@ -1345,15 +1600,15 @@ class MainWindow(QMainWindow):
 
         return scroll_area
 
-    @staticmethod
-    def create_model_section(label_text, combo, tooltip_label):
+    def create_model_section(self, label_text, combo, tooltip_label):
         layout = QVBoxLayout()
         label = QLabel(label_text)
-        label.setStyleSheet("font-weight: bold; font-size: 10pt;")
+        label_stylesheet = """font-size: 10pt;"""
+        ScalingUtils.set_scaled_stylesheet(self, label_stylesheet, self.scaling_factor)
         layout.addWidget(label)
         layout.addWidget(combo)
         layout.addWidget(tooltip_label)
-        layout.addSpacing(10)  # Add some space between sections
+        layout.addSpacing(ScalingUtils.scale_size(10, self.scaling_factor))  # Add some space between sections
         return layout
 
     def browse_inference_env(self):
@@ -1489,7 +1744,7 @@ class MainWindow(QMainWindow):
                     os.makedirs('presets')
                     logger.info("Created presets directory")
                 with open(f"presets/{name}.json", "w") as f:
-                    json.dump(preset, f, indent=4)
+                    json.dump(preset, f, ensure_ascii=False, indent=4)
                 self.load_presets()
                 index = self.preset_combo.findText(name)
                 if index >= 0:
@@ -1533,6 +1788,38 @@ class MainWindow(QMainWindow):
                                 "The input folder is empty. Please add some audio files and try again.")
             return
 
+        is_valid, missing_items = self.validate_selected_models()
+        if not is_valid:
+            logger.error(f"Model validation failed with {len(missing_items)} missing items")
+            QApplication.beep()
+            organized_missing = self.organize_missing_items(missing_items)
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Model validation failed")
+            dialog.setModal(True)
+            dialog.setMinimumSize(600, 400)
+            layout = QVBoxLayout(dialog)
+            label = QLabel("The following models or configuration files are missing. Please download and place them in the correct location, then try again:")
+            label.setWordWrap(True)
+            layout.addWidget(label)
+            text_edit = QTextEdit()
+            text_edit.setReadOnly(True)
+            text_edit.setPlainText(organized_missing)
+            text_edit.setStyleSheet("""
+                    QTextEdit {
+                        background-color: #f0f4f8;
+                        border: 1px solid #dee2e6;
+                        border-radius: 4px;
+                        padding: 8px;
+                    }
+                """)
+            layout.addWidget(text_edit)
+            button_box = QDialogButtonBox(QDialogButtonBox.Ok)
+            button_box.accepted.connect(dialog.accept)
+            layout.addWidget(button_box)
+            dialog.exec_()
+            return
+
+        # Inference
         inference_base = inference_env + ' inference.py'
         fast_inference = self.fast_inference_checkbox.isChecked()
         force_cpu = self.force_cpu_checkbox.isChecked()
@@ -1575,7 +1862,7 @@ class MainWindow(QMainWindow):
         self.inference_thread.start()
 
         self.run_button.setText("Stop Inference")
-        self.run_button.setStyleSheet("""
+        run_button_stylesheet = """
             QPushButton {
                 background-color: #FF4136;
                 color: white;
@@ -1595,7 +1882,8 @@ class MainWindow(QMainWindow):
                 padding-top: 10px;
                 padding-bottom: 6px;
             }
-        """)
+        """
+        self.run_button.setStyleSheet(ScalingUtils.scale_stylesheet(run_button_stylesheet, self.scaling_factor))
         self.run_button.clicked.disconnect()
         self.run_button.clicked.connect(self.stop_inference)
 
@@ -1626,9 +1914,9 @@ class MainWindow(QMainWindow):
             cursor.removeSelectedText()
             self.update_output(text, color='#ffa500', auto_newline=False)
         else:
-            if text.startswith("MODULE:"):
+            if text.startswith("Module:"):
                 self.print_separator(char='=')
-                self.update_output(text, color='#6e71ff', bold=True)
+                self.update_output(text, color='#6e71ff')
             elif text.startswith("Command:"):
                 self.update_output(text, color='yellow', italic=True)
                 self.print_separator(char='-')
@@ -1674,6 +1962,62 @@ class MainWindow(QMainWindow):
     def print_separator(self, char='-'):
         self.update_output(char * 80, color='gray')
 
+    def validate_selected_models(self):
+        missing_items = []
+        selected_models = []
+        model_categories = [
+            ("Vocal Model", self.vocal_model_combo.currentText()),
+            ("Karaoke Model", self.kara_model_combo.currentText()),
+            ("Reverb Model", self.reverb_model_combo.currentText()),
+            ("Other Model", self.other_model_combo.currentText())
+        ]
+
+        for category_name, model_name in model_categories:
+            if model_name != "None":
+                selected_models.append((category_name, model_name))
+        if not selected_models:
+            return True, []
+
+        fast_inference = self.fast_inference_checkbox.isChecked()
+        for module_name, model in selected_models:
+            model_path = os.path.join("pretrain", model)
+            if not os.path.exists(model_path):
+                missing_items.append(f"{module_name} - Missing model file: {model}")
+            config_paths = self.config["config_paths"].get(model, [None, None])
+            config_path = config_paths[1] if fast_inference else config_paths[0]
+            if not config_path:
+                config_type = "Fast" if fast_inference else "Standard"
+                missing_items.append(f"{module_name} - Missing {config_type} config file path")
+            elif not os.path.exists(config_path):
+                config_type = "Fast" if fast_inference else "Standard"
+                missing_items.append(f"{module_name} - Missing {config_type} config file: {os.path.basename(config_path)}")
+        return len(missing_items) == 0, missing_items
+
+    @staticmethod
+    def organize_missing_items(missing_items):
+        organized = {}
+        for item in missing_items:
+            if " - " in item:
+                module_part, detail_part = item.split(" - ", 1)
+                if module_part not in organized:
+                    organized[module_part] = []
+                organized[module_part].append(detail_part)
+            else:
+                if "Other" not in organized:
+                    organized["Other"] = []
+                organized["Other"].append(item)
+        output = []
+        for module, items in organized.items():
+            output.append(f"【{module}】")
+            for item in items:
+                output.append(f"  • {item}")
+            output.append("")
+        output.append("[Steps]")
+        output.append("1. Please download the above missing models and their configuration files.")
+        output.append("2. Place the models in the 'pretrain' folder and the configuration files in the 'configs' folder.")
+        output.append("3. Run the inference again.")
+        return "\n".join(output)
+
     def run_archive(self):
         logger.info("Starting archive process")
 
@@ -1684,12 +2028,24 @@ class MainWindow(QMainWindow):
         def archive_output_callback(text):
             self.update_output(text, color='#6e71ff')
 
-        archive_folders(output_callback=archive_output_callback)
+        try:
+            archive_folders(output_callback=archive_output_callback)
 
-        logger.info("Archive process completed")
-        self.print_separator()
-        self.update_output("Archive process completed.", color='green')
-        self.print_separator()
+            logger.info("Archive process completed")
+            self.print_separator()
+            self.update_output("Archive process completed.", color='green')
+            self.print_separator()
+        except Exception as e:
+            error_msg = f"Error occurred during archiving: {str(e)}"
+            logger.error(f"Archive process failed: {error_msg}")
+            self.update_output("An error occurred during archiving!", color='red')
+            self.update_output(error_msg, color='red')
+            self.print_separator()
+            QMessageBox.critical(
+                self,
+                "Archiving Error",
+                f"An error occurred during archiving:\n\n{str(e)}\n\nPlease check if the files are being used by another program and try again."
+            )
 
     def open_config_editor(self):
         dialog = ConfigEditorDialog(self.config, self)
@@ -1728,10 +2084,19 @@ class MainWindow(QMainWindow):
                                  Q_ARG(bool, auto_newline),
                                  Q_ARG(int, delay))
 
+    def center_on_screen(self):
+        screen_geometry = QApplication.primaryScreen().geometry()
+        x = (screen_geometry.width() - self.width()) // 2
+        y = (screen_geometry.height() - self.height()) // 2
+        self.move(x, y)
+
 
 if __name__ == "__main__":
     logger.info("Starting application")
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication(sys.argv)
+    app.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     remove_screen_splash()
     window = MainWindow()
     window.show()
