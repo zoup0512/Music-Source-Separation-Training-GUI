@@ -1,0 +1,74 @@
+# API Server Configuration
+# This file contains default configuration values for the MSST API Server
+
+server:
+  # Host address to bind to (0.0.0.0 allows external connections)
+  host: "0.0.0.0"
+  
+  # Port to listen on
+  port: 8000
+  
+  # Number of concurrent worker threads for task processing
+  workers: 2
+
+files:
+  # Maximum file size for uploads in MB
+  max_file_size_mb: 500
+  
+  # Directory for storing uploaded audio files
+  upload_dir: "./api_uploads"
+  
+  # Directory for storing separated audio output files
+  output_dir: "./api_outputs"
+
+cleanup:
+  # Enable automatic cleanup of old tasks
+  enabled: true
+  
+  # Hours to retain completed task files before deletion
+  completed_retention_hours: 24
+  
+  # Hours to retain failed task files before deletion
+  failed_retention_hours: 24
+  
+  # Days to retain task metadata in database before deletion
+  metadata_retention_days: 7
+
+models:
+  # Default model type to use when not specified
+  default_model_type: "mdx23c"
+  
+  # Number of models to keep loaded in memory (LRU cache)
+  model_cache_size: 3
+  
+  # Force CPU-only processing (disable GPU)
+  force_cpu: false
+  
+  # GPU device IDs to use for processing (empty list = auto-detect)
+  device_ids: [0]
+
+auth:
+  # Enable API key authentication
+  enabled: false
+  
+  # List of valid API keys (only used when auth is enabled)
+  # Generate secure keys with: python -c "import secrets; print(secrets.token_urlsafe(32))"
+  api_keys: []
+
+rate_limit:
+  # Enable rate limiting per API key
+  enabled: false
+  
+  # Maximum requests per hour per API key
+  requests_per_hour: 100
+
+database:
+  # Path to SQLite database file
+  path: "./api_server.db"
+
+logging:
+  # Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  level: "INFO"
+  
+  # Path to log file
+  file: "./api_server.log"
