@@ -76,3 +76,4 @@ results/
 wandb/
 .idea
 idea/
+/msst_gui.log
