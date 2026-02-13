@@ -74,3 +74,5 @@ Scripts/
 
 results/
 wandb/
+.idea
+idea/
